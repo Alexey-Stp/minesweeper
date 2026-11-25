@@ -10,6 +10,9 @@ and grid are vector-drawn, and the symbols are Unicode emoji.
 cargo run --release
 ```
 
+In VS Code, press <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd> to run the game, or use **Terminal → Run Task…** and pick
+**Run**, **Run (release)**, **Build** or **Test** (defined in [`.vscode/tasks.json`](.vscode/tasks.json)).
+
 Requires a recent stable Rust toolchain (edition 2024). On Linux, eframe also needs the system windowing and
 OpenGL development libraries; see the [egui README](https://github.com/emilk/egui#demo) for the package list.
 
