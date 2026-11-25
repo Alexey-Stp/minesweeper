@@ -1,0 +1,10 @@
+[package]
+name = "minesweeper"
+version = "0.1.0"
+edition = "2024"
+description = "A clone of classic Windows Minesweeper built with eframe/egui"
+publish = false
+
+[dependencies]
+eframe = "0.37"
+rand = "0.10"
