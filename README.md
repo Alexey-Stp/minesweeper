@@ -53,3 +53,7 @@ Each file has its tests at the bottom, written against that module's interface:
 - `board_input.rs` replays mouse sequences (press, drag, release, both buttons at once) and checks the moves and
   the pressed-in cells they produce.
 - `main.rs` covers the counter digits, the face and mapping screen points to cells.
+
+## License
+
+[MIT](LICENSE)
