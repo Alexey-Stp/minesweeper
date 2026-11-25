@@ -1,12 +1,12 @@
 # Minesweeper
 
 A clone of classic Windows Minesweeper written in Rust with [`eframe`/`egui`](https://github.com/emilk/egui).
-There are no image assets: the bevels, seven-segment counters and grid are vector-drawn, and the symbols are
+There are no image assets: the bevels, seven-segment counters and grid lines are vector-drawn, and the symbols are
 Unicode emoji.
 
 | File | What lives there |
 | --- | --- |
-| [`src/game.rs`](src/game.rs) | The rules of play: mine layout, reveal and flood fill, marks, chords, win and loss, the timer |
+| [`src/game.rs`](src/game.rs) | The rules of play: the board's shape, mine layout, reveal and flood fill, marks, chords, win and loss, the timer |
 | [`src/board_input.rs`](src/board_input.rs) | The mouse rules: how presses and releases on the board become reveals, marks and chords |
 | [`src/main.rs`](src/main.rs) | The egui side: window, layout, reading the pointer and painting |
 
@@ -28,9 +28,9 @@ OpenGL development libraries; see the [egui README](https://github.com/emilk/egu
 
 | Input | Action |
 | --- | --- |
-| Left click | Reveal a cell. The first click is always safe, and so are its neighbours. |
-| Right click | Cycle a covered cell: flag 🚩 → question mark `?` → unmarked |
-| Middle click, or left + right together | Chord: on a revealed number whose flags are all placed, reveal its other neighbours |
+| Left button | Reveal a cell. The first reveal is always safe, and so are its neighbours when there is room. |
+| Right button | Cycle a covered cell: flag 🚩 → question mark `?` → unmarked |
+| Middle button, or left + right together | Chord: on a revealed number whose flags are all placed, reveal its other neighbours |
 | The face above the board, or <kbd>F2</kbd> | New game |
 | **Game** menu | New game, Beginner (9×9, 10 mines), Intermediate (16×16, 40), Expert (30×16, 99) |
 

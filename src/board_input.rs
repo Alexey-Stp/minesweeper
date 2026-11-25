@@ -28,7 +28,7 @@ impl Buttons {
 pub struct PointerFrame {
     /// The board cell under the pointer, if any.
     pub cell: Option<usize>,
-    /// The pointer is over the board and nothing else (an open menu, say) covers it there.
+    /// The pointer is over the board and nothing else (an open menu, say) lies over it there.
     /// Gestures only start when this holds.
     pub on_board: bool,
     pub down: Buttons,
@@ -38,10 +38,10 @@ pub struct PointerFrame {
 
 /// How the board should look this frame while buttons are held.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Feedback {
+pub struct HoldFeedback {
     /// Cells drawn pushed in.
     pub pressed_cells: Vec<usize>,
-    /// A button is held down on the board, so the face gasps.
+    /// A button is held down on the board. The face gasps at this while the game is on.
     pub holding: bool,
 }
 
@@ -67,7 +67,7 @@ pub struct BoardInput {
 impl BoardInput {
     /// Advances the gesture by one frame, applies any move it completes to `game` at `now`,
     /// and says how the board should look.
-    pub fn frame(&mut self, game: &mut Game, pointer: PointerFrame, now: Instant) -> Feedback {
+    pub fn frame(&mut self, game: &mut Game, pointer: PointerFrame, now: Instant) -> HoldFeedback {
         self.advance(game, pointer, now);
         self.feedback(game, pointer)
     }
@@ -120,7 +120,7 @@ impl BoardInput {
 
     /// Cells look pushed in while held, as in the original: the one under the pointer, or
     /// it and its neighbours for a chord.
-    fn feedback(&self, game: &Game, pointer: PointerFrame) -> Feedback {
+    fn feedback(&self, game: &Game, pointer: PointerFrame) -> HoldFeedback {
         let holding = match self.gesture {
             Gesture::Press => pointer.down.left,
             Gesture::Chord => true,
@@ -129,14 +129,16 @@ impl BoardInput {
         let pressed_cells = match pointer.cell {
             Some(cell) if holding && !game.is_over() => {
                 if self.gesture == Gesture::Chord {
-                    std::iter::once(cell).chain(game.neighbors(cell)).collect()
+                    std::iter::once(cell)
+                        .chain(game.board().neighbours(cell))
+                        .collect()
                 } else {
                     vec![cell]
                 }
             }
             _ => Vec::new(),
         };
-        Feedback {
+        HoldFeedback {
             pressed_cells,
             holding,
         }
@@ -150,7 +152,7 @@ impl BoardInput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::{CellView, GameStatus, MineLayout};
+    use crate::game::{Board, CellView, GameStatus, MineLayout};
 
     const NONE: Buttons = Buttons {
         left: false,
@@ -179,22 +181,22 @@ mod tests {
         game: Game,
         cell: Option<usize>,
         held: Buttons,
-        /// Something covers the board, so the pointer is over a cell but not on the board.
-        covered: bool,
+        /// Something lies over the board, so the pointer is over a cell but not on the board.
+        obscured: bool,
     }
 
     impl Mouse {
         fn new() -> Self {
             Self {
                 input: BoardInput::default(),
-                game: Game::new(3, 3, MineLayout::Fixed(vec![0, 8])),
+                game: Game::new(Board::new(3, 3), MineLayout::Fixed(vec![0, 8])),
                 cell: None,
                 held: NONE,
-                covered: false,
+                obscured: false,
             }
         }
 
-        fn step(&mut self, pressed: Buttons, released: Buttons) -> Feedback {
+        fn step(&mut self, pressed: Buttons, released: Buttons) -> HoldFeedback {
             let next = |held: bool, p: bool, r: bool| (held || p) && !r;
             self.held = Buttons {
                 left: next(self.held.left, pressed.left, released.left),
@@ -203,7 +205,7 @@ mod tests {
             };
             let pointer = PointerFrame {
                 cell: self.cell,
-                on_board: self.cell.is_some() && !self.covered,
+                on_board: self.cell.is_some() && !self.obscured,
                 down: self.held,
                 pressed,
                 released,
@@ -211,30 +213,31 @@ mod tests {
             self.input.frame(&mut self.game, pointer, Instant::now())
         }
 
-        fn move_to(&mut self, cell: Option<usize>) -> Feedback {
+        fn move_to(&mut self, cell: Option<usize>) -> HoldFeedback {
             self.cell = cell;
             self.step(NONE, NONE)
         }
 
-        fn press(&mut self, buttons: Buttons) -> Feedback {
+        fn press(&mut self, buttons: Buttons) -> HoldFeedback {
             self.step(buttons, NONE)
         }
 
-        fn release(&mut self, buttons: Buttons) -> Feedback {
+        fn release(&mut self, buttons: Buttons) -> HoldFeedback {
             self.step(NONE, buttons)
         }
 
-        fn click(&mut self, cell: usize, buttons: Buttons) {
+        /// A whole gesture on one cell: press `buttons` over `cell`, then release them.
+        fn press_and_release(&mut self, cell: usize, buttons: Buttons) {
             self.move_to(Some(cell));
             self.press(buttons);
             self.release(buttons);
         }
 
-        /// Opens the 2 in the middle and flags both mines, ready to chord.
+        /// Reveals the 2 in the middle and flags both mines, ready to chord.
         fn ready_to_chord(&mut self) {
-            self.click(4, LEFT);
-            self.click(0, RIGHT);
-            self.click(8, RIGHT);
+            self.press_and_release(4, LEFT);
+            self.press_and_release(0, RIGHT);
+            self.press_and_release(8, RIGHT);
             self.move_to(Some(4));
         }
     }
@@ -245,20 +248,20 @@ mod tests {
     }
 
     #[test]
-    fn left_click_reveals_on_release() {
+    fn left_release_reveals() {
         let mut mouse = Mouse::new();
         mouse.move_to(Some(4));
         let held = mouse.press(LEFT);
         assert_eq!(
             held,
-            Feedback {
+            HoldFeedback {
                 pressed_cells: vec![4],
                 holding: true
             }
         );
-        assert_eq!(mouse.game.view(4), CellView::Hidden);
+        assert_eq!(mouse.game.view(4), CellView::Covered);
 
-        assert_eq!(mouse.release(LEFT), Feedback::default());
+        assert_eq!(mouse.release(LEFT), HoldFeedback::default());
         assert_eq!(mouse.game.view(4), CellView::Open(2));
     }
 
@@ -270,7 +273,7 @@ mod tests {
         assert_eq!(mouse.move_to(Some(1)).pressed_cells, [1]);
         mouse.release(LEFT);
         assert_eq!(mouse.game.view(1), CellView::Open(1));
-        assert_eq!(mouse.game.view(4), CellView::Hidden);
+        assert_eq!(mouse.game.view(4), CellView::Covered);
     }
 
     #[test]
@@ -281,7 +284,7 @@ mod tests {
         let dragged_off = mouse.move_to(None);
         assert_eq!(
             dragged_off,
-            Feedback {
+            HoldFeedback {
                 pressed_cells: Vec::new(),
                 holding: true
             }
@@ -295,31 +298,31 @@ mod tests {
         let mut mouse = Mouse::new();
         mouse.move_to(None);
         mouse.press(LEFT);
-        assert_eq!(mouse.move_to(Some(4)), Feedback::default());
+        assert_eq!(mouse.move_to(Some(4)), HoldFeedback::default());
         mouse.release(LEFT);
         assert_eq!(mouse.game.status(), GameStatus::Ready);
     }
 
     #[test]
-    fn presses_on_something_covering_the_board_are_ignored() {
+    fn presses_on_something_over_the_board_are_ignored() {
         let mut mouse = Mouse::new();
-        mouse.covered = true;
-        mouse.click(4, LEFT);
-        mouse.click(1, RIGHT);
-        assert_eq!(mouse.game.view(4), CellView::Hidden);
-        assert_eq!(mouse.game.view(1), CellView::Hidden);
+        mouse.obscured = true;
+        mouse.press_and_release(4, LEFT);
+        mouse.press_and_release(1, RIGHT);
+        assert_eq!(mouse.game.view(4), CellView::Covered);
+        assert_eq!(mouse.game.view(1), CellView::Covered);
     }
 
     #[test]
     fn right_press_marks_at_once_and_its_release_does_nothing() {
         let mut mouse = Mouse::new();
         mouse.move_to(Some(4));
-        assert_eq!(mouse.press(RIGHT), Feedback::default());
+        assert_eq!(mouse.press(RIGHT), HoldFeedback::default());
         assert_eq!(mouse.game.view(4), CellView::Flag);
         mouse.release(RIGHT);
         assert_eq!(mouse.game.view(4), CellView::Flag);
 
-        mouse.click(4, RIGHT);
+        mouse.press_and_release(4, RIGHT);
         assert_eq!(mouse.game.view(4), CellView::Question);
     }
 
@@ -337,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn middle_click_chords() {
+    fn middle_button_chords() {
         let mut mouse = Mouse::new();
         mouse.ready_to_chord();
         mouse.press(MIDDLE);
@@ -354,27 +357,27 @@ mod tests {
         assert_eq!(sorted(held.pressed_cells), [0, 1, 2, 3, 4, 5]);
         mouse.release(LEFT);
         mouse.release(RIGHT);
-        assert_eq!(mouse.game.view(1), CellView::Hidden);
+        assert_eq!(mouse.game.view(1), CellView::Covered);
     }
 
     #[test]
     fn after_a_chord_the_remaining_release_does_not_reveal() {
         let mut mouse = Mouse::new();
-        mouse.click(4, LEFT); // the 2, with no flags around it: this chord does nothing
+        mouse.press_and_release(4, LEFT); // the 2, with no flags around it: this chord does nothing
         mouse.press(LEFT);
         mouse.press(RIGHT);
         let spent = mouse.release(RIGHT);
-        assert_eq!(spent, Feedback::default());
+        assert_eq!(spent, HoldFeedback::default());
 
         mouse.move_to(Some(2));
         mouse.release(LEFT);
-        assert_eq!(mouse.game.view(2), CellView::Hidden);
+        assert_eq!(mouse.game.view(2), CellView::Covered);
     }
 
     #[test]
     fn nothing_looks_pressed_once_the_game_is_over() {
         let mut mouse = Mouse::new();
-        mouse.click(0, LEFT); // a mine
+        mouse.press_and_release(0, LEFT); // a mine
         assert!(matches!(mouse.game.status(), GameStatus::Lost { .. }));
         mouse.move_to(Some(4));
         assert_eq!(mouse.press(LEFT).pressed_cells, Vec::<usize>::new());

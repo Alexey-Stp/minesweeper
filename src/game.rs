@@ -2,10 +2,11 @@
 //!
 //! Callers play through [`Game`]'s interface: moves in ([`Game::reveal`], [`Game::cycle_mark`],
 //! [`Game::chord`]), views out ([`Game::view`], [`Game::status`] and the counters). Where the
-//! mines go comes in across the [`MineLayout`] seam, and the time comes in with each call, so a
-//! game is fully determined by its inputs.
+//! mines go comes in across the [`MineLayout`] seam, and the time comes in with every move that
+//! can start or end the game, so a game is fully determined by its inputs.
 
 use std::collections::VecDeque;
+use std::ops::Range;
 use std::time::Instant;
 
 use rand::SeedableRng;
@@ -40,18 +41,68 @@ impl Difficulty {
     }
 }
 
+/// The shape of a board: its size, and how its cells are numbered (row by row from the top
+/// left, starting at 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Board {
+    cols: usize,
+    rows: usize,
+}
+
+impl Board {
+    /// A board of `cols` × `rows` cells; each side is at least one cell.
+    pub fn new(cols: usize, rows: usize) -> Self {
+        Self {
+            cols: cols.max(1),
+            rows: rows.max(1),
+        }
+    }
+
+    pub fn cols(self) -> usize {
+        self.cols
+    }
+
+    pub fn rows(self) -> usize {
+        self.rows
+    }
+
+    /// Every cell, in order.
+    pub fn cells(self) -> Range<usize> {
+        0..self.cols * self.rows
+    }
+
+    /// The cell at column `col` of row `row`.
+    pub fn cell(self, col: usize, row: usize) -> usize {
+        row * self.cols + col
+    }
+
+    /// The column and row of `cell`.
+    pub fn position(self, cell: usize) -> (usize, usize) {
+        (cell % self.cols, cell / self.cols)
+    }
+
+    /// The neighbours of `cell`: 3 in a corner, 5 on an edge, 8 inside.
+    pub fn neighbours(self, cell: usize) -> impl Iterator<Item = usize> {
+        let (col, row) = self.position(cell);
+        (-1isize..=1)
+            .flat_map(|dy| (-1isize..=1).map(move |dx| (dx, dy)))
+            .filter(|&offset| offset != (0, 0))
+            .filter_map(move |(dx, dy)| {
+                let c = col.checked_add_signed(dx).filter(|&c| c < self.cols)?;
+                let r = row.checked_add_signed(dy).filter(|&r| r < self.rows)?;
+                Some(self.cell(c, r))
+            })
+    }
+}
+
 /// Where the mines go. Chosen when the game is created and laid on the first reveal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MineLayout {
     /// `mines` cells picked by a random generator seeded with `seed`, keeping the first
     /// revealed cell clear and, when there is room, its neighbours too.
     Random { mines: usize, seed: u64 },
-    /// Exactly these cells hold mines; indices off the board are ignored. The first reveal
-    /// gets no protection.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the tests' adapter; play always uses `Random`")
-    )]
+    /// Exactly these cells hold mines; cells off the board and repeats are ignored. The first
+    /// reveal gets no protection. Play always uses `Random`; tests use this for known boards.
     Fixed(Vec<usize>),
 }
 
@@ -63,44 +114,93 @@ impl MineLayout {
             seed: rand::random(),
         }
     }
+
+    /// The layout fitted to `board`: a random layout leaves at least one cell free for the
+    /// first reveal, and a fixed one drops cells off the board and repeats.
+    fn fitted(self, board: Board) -> Self {
+        let len = board.cells().len();
+        match self {
+            Self::Random { mines, seed } => Self::Random {
+                mines: mines.min(len - 1),
+                seed,
+            },
+            Self::Fixed(mut cells) => {
+                cells.retain(|&cell| cell < len);
+                cells.sort_unstable();
+                cells.dedup();
+                Self::Fixed(cells)
+            }
+        }
+    }
+
+    /// How many mines the layout lays.
+    fn mine_count(&self) -> usize {
+        match self {
+            Self::Random { mines, .. } => *mines,
+            Self::Fixed(cells) => cells.len(),
+        }
+    }
+
+    /// The cells to mine on `board` when `first` is the first cell revealed.
+    fn mined_cells(self, board: Board, first: usize) -> Vec<usize> {
+        match self {
+            Self::Random { mines, seed } => {
+                let mut protected: Vec<usize> = std::iter::once(first)
+                    .chain(board.neighbours(first))
+                    .collect();
+                if board.cells().len() - protected.len() < mines {
+                    // Too crowded to clear the whole 3x3 block: protect only the first cell.
+                    protected.truncate(1);
+                }
+                let mut candidates: Vec<usize> = board
+                    .cells()
+                    .filter(|cell| !protected.contains(cell))
+                    .collect();
+                candidates.shuffle(&mut StdRng::seed_from_u64(seed));
+                candidates.truncate(mines);
+                candidates
+            }
+            Self::Fixed(cells) => cells,
+        }
+    }
 }
 
 /// What the player has done to a cell. Whether the cell holds a mine is separate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CellState {
-    Hidden,
+    Covered,
     Flagged,
     Questioned,
     Revealed,
 }
 
 impl CellState {
-    /// Flags protect a cell from being opened; question marks do not.
-    const fn is_openable(self) -> bool {
-        matches!(self, Self::Hidden | Self::Questioned)
+    /// Flags protect a cell from being revealed; question marks do not.
+    const fn can_be_revealed(self) -> bool {
+        matches!(self, Self::Covered | Self::Questioned)
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Cell {
     mine: bool,
-    /// Number of mines among the (up to eight) surrounding cells.
-    adjacent: u8,
+    /// How many of the cell's neighbours hold mines.
+    number: u8,
     state: CellState,
 }
 
 impl Cell {
     const FRESH: Self = Self {
         mine: false,
-        adjacent: 0,
-        state: CellState::Hidden,
+        number: 0,
+        state: CellState::Covered,
     };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GameStatus {
     /// Waiting for the first reveal. No mines are laid yet, which is what makes the first
-    /// click safe.
+    /// reveal safe.
     Ready,
     Playing {
         started: Instant,
@@ -108,7 +208,7 @@ pub enum GameStatus {
     Won {
         seconds: u64,
     },
-    /// `exploded` is the index of the mine that ended the game.
+    /// `exploded` is the mine whose reveal ended the game.
     Lost {
         seconds: u64,
         exploded: usize,
@@ -118,10 +218,10 @@ pub enum GameStatus {
 /// How a cell is drawn, derived from its state and the game status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellView {
-    Hidden,
+    Covered,
     Flag,
     Question,
-    /// A revealed safe cell and its adjacent-mine count (0 draws blank).
+    /// A revealed safe cell and its number (0 draws blank).
     Open(u8),
     Mine,
     ExplodedMine,
@@ -129,8 +229,7 @@ pub enum CellView {
 }
 
 pub struct Game {
-    cols: usize,
-    rows: usize,
+    board: Board,
     mines: usize,
     cells: Vec<Cell>,
     status: GameStatus,
@@ -141,31 +240,12 @@ pub struct Game {
 }
 
 impl Game {
-    pub fn new(cols: usize, rows: usize, layout: MineLayout) -> Self {
-        let (cols, rows) = (cols.max(1), rows.max(1));
-        let len = cols * rows;
-        let layout = match layout {
-            // One cell must stay free for the guaranteed-safe first click.
-            MineLayout::Random { mines, seed } => MineLayout::Random {
-                mines: mines.min(len - 1),
-                seed,
-            },
-            MineLayout::Fixed(mut cells) => {
-                cells.retain(|&i| i < len);
-                cells.sort_unstable();
-                cells.dedup();
-                MineLayout::Fixed(cells)
-            }
-        };
-        let mines = match &layout {
-            MineLayout::Random { mines, .. } => *mines,
-            MineLayout::Fixed(cells) => cells.len(),
-        };
+    pub fn new(board: Board, layout: MineLayout) -> Self {
+        let layout = layout.fitted(board);
         Self {
-            cols,
-            rows,
-            mines,
-            cells: vec![Cell::FRESH; len],
+            board,
+            mines: layout.mine_count(),
+            cells: vec![Cell::FRESH; board.cells().len()],
             status: GameStatus::Ready,
             flags: 0,
             revealed: 0,
@@ -175,12 +255,11 @@ impl Game {
 
     pub fn with_difficulty(difficulty: Difficulty) -> Self {
         let (cols, rows, mines) = difficulty.spec();
-        Self::new(cols, rows, MineLayout::random(mines))
+        Self::new(Board::new(cols, rows), MineLayout::random(mines))
     }
 
-    /// Board dimensions as `(columns, rows)`. Cells are indexed row by row from the top left.
-    pub fn size(&self) -> (usize, usize) {
-        (self.cols, self.rows)
+    pub fn board(&self) -> Board {
+        self.board
     }
 
     pub fn status(&self) -> GameStatus {
@@ -208,25 +287,13 @@ impl Game {
         }
     }
 
-    /// In-bounds neighbours of `idx`: 3 in a corner, 5 on an edge, 8 inside.
-    /// The iterator does not borrow `self`, so callers may mutate while iterating.
-    pub fn neighbors(&self, idx: usize) -> impl Iterator<Item = usize> + use<> {
-        let (cols, rows) = (self.cols, self.rows);
-        let (x, y) = (idx % cols, idx / cols);
-        (-1isize..=1)
-            .flat_map(|dy| (-1isize..=1).map(move |dx| (dx, dy)))
-            .filter(|&offset| offset != (0, 0))
-            .filter_map(move |(dx, dy)| {
-                let nx = x.checked_add_signed(dx).filter(|&nx| nx < cols)?;
-                let ny = y.checked_add_signed(dy).filter(|&ny| ny < rows)?;
-                Some(ny * cols + nx)
-            })
-    }
-
-    /// Left click: open a cell. The first reveal lays the mines and starts the clock at `now`.
+    /// Reveals a covered cell. The first reveal lays the mines and starts the timer at `now`.
     pub fn reveal(&mut self, idx: usize, now: Instant) {
-        let openable = self.cells.get(idx).is_some_and(|c| c.state.is_openable());
-        if self.is_over() || !openable {
+        let can_reveal = self
+            .cells
+            .get(idx)
+            .is_some_and(|c| c.state.can_be_revealed());
+        if self.is_over() || !can_reveal {
             return;
         }
         if let Some(layout) = self.layout.take() {
@@ -241,7 +308,8 @@ impl Game {
         }
     }
 
-    /// Right click: Hidden -> Flagged -> Questioned -> Hidden.
+    /// Marks a covered cell, cycling flag -> question mark -> unmarked. Revealed cells
+    /// cannot be marked.
     pub fn cycle_mark(&mut self, idx: usize) {
         if self.is_over() {
             return;
@@ -250,7 +318,7 @@ impl Game {
             return;
         };
         cell.state = match cell.state {
-            CellState::Hidden => {
+            CellState::Covered => {
                 self.flags += 1;
                 CellState::Flagged
             }
@@ -258,13 +326,13 @@ impl Game {
                 self.flags -= 1;
                 CellState::Questioned
             }
-            CellState::Questioned => CellState::Hidden,
+            CellState::Questioned => CellState::Covered,
             CellState::Revealed => return,
         };
     }
 
-    /// Middle click (or left+right): when a revealed number has exactly that many
-    /// flags around it, open every other covered neighbour.
+    /// Chords on a revealed number: when exactly that many of its neighbours are flagged,
+    /// reveals every other covered neighbour.
     pub fn chord(&mut self, idx: usize, now: Instant) {
         if !matches!(self.status, GameStatus::Playing { .. }) {
             return;
@@ -272,24 +340,25 @@ impl Game {
         let Some(&cell) = self.cells.get(idx) else {
             return;
         };
-        if cell.state != CellState::Revealed || cell.adjacent == 0 {
+        if cell.state != CellState::Revealed || cell.number == 0 {
             return;
         }
         let flags = self
-            .neighbors(idx)
+            .board
+            .neighbours(idx)
             .filter(|&n| self.cells[n].state == CellState::Flagged)
             .count();
-        if flags != usize::from(cell.adjacent) {
+        if flags != usize::from(cell.number) {
             return;
         }
 
         let mut exploded = None;
-        for n in self.neighbors(idx) {
-            let neighbor = self.cells[n];
-            if !neighbor.state.is_openable() {
+        for n in self.board.neighbours(idx) {
+            let neighbour = self.cells[n];
+            if !neighbour.state.can_be_revealed() {
                 continue;
             }
-            if neighbor.mine {
+            if neighbour.mine {
                 exploded.get_or_insert(n);
             } else {
                 self.flood_reveal(n);
@@ -316,63 +385,45 @@ impl Game {
             }
         }
         match cell.state {
-            CellState::Hidden => CellView::Hidden,
+            CellState::Covered => CellView::Covered,
             CellState::Flagged => CellView::Flag,
             CellState::Questioned => CellView::Question,
-            CellState::Revealed => CellView::Open(cell.adjacent),
+            CellState::Revealed => CellView::Open(cell.number),
         }
     }
 
-    /// Lays the mines for a first reveal of `first`, then counts every cell's neighbouring mines.
+    /// Lays the mines for a first reveal of `first`, then works out every cell's number.
     fn lay_mines(&mut self, layout: MineLayout, first: usize) {
-        let mines = match layout {
-            MineLayout::Random { mines, seed } => {
-                self.scatter(mines, first, &mut StdRng::seed_from_u64(seed))
-            }
-            MineLayout::Fixed(cells) => cells,
-        };
-        for i in mines {
-            self.cells[i].mine = true;
+        for cell in layout.mined_cells(self.board, first) {
+            self.cells[cell].mine = true;
         }
-        for i in 0..self.cells.len() {
-            let count = self.neighbors(i).filter(|&n| self.cells[n].mine).count();
-            self.cells[i].adjacent = count as u8;
+        for i in self.board.cells() {
+            let mines = self
+                .board
+                .neighbours(i)
+                .filter(|&n| self.cells[n].mine)
+                .count();
+            self.cells[i].number = mines as u8;
         }
     }
 
-    /// `mines` random cells, keeping `first` and, when there is room, its neighbours clear.
-    fn scatter(&self, mines: usize, first: usize, rng: &mut StdRng) -> Vec<usize> {
-        let mut protected: Vec<usize> = std::iter::once(first)
-            .chain(self.neighbors(first))
-            .collect();
-        if self.cells.len() - protected.len() < mines {
-            // Too crowded to clear the whole 3x3 block: protect only the clicked cell.
-            protected.truncate(1);
-        }
-        let mut candidates: Vec<usize> = (0..self.cells.len())
-            .filter(|i| !protected.contains(i))
-            .collect();
-        candidates.shuffle(rng);
-        candidates.truncate(mines);
-        candidates
-    }
-
-    /// Opens `start` and, through blank cells, everything connected to it (BFS).
-    /// Numbered cells on the border are opened but not expanded; flags are never opened.
+    /// Reveals `start` and, through blank cells, everything connected to it (BFS).
+    /// Numbers on the border are revealed but not expanded; flagged cells are never revealed.
     fn flood_reveal(&mut self, start: usize) {
         let mut queue = VecDeque::from([start]);
         while let Some(i) = queue.pop_front() {
             let cell = &mut self.cells[i];
-            if cell.mine || !cell.state.is_openable() {
+            if cell.mine || !cell.state.can_be_revealed() {
                 continue;
             }
             cell.state = CellState::Revealed;
-            let blank = cell.adjacent == 0;
+            let blank = cell.number == 0;
             self.revealed += 1;
             if blank {
                 queue.extend(
-                    self.neighbors(i)
-                        .filter(|&n| self.cells[n].state.is_openable()),
+                    self.board
+                        .neighbours(i)
+                        .filter(|&n| self.cells[n].state.can_be_revealed()),
                 );
             }
         }
@@ -420,29 +471,31 @@ mod tests {
             .filter(|&(_, ch)| ch == '*')
             .map(|(i, _)| i)
             .collect();
-        Game::new(rows[0].len(), rows.len(), MineLayout::Fixed(mines))
+        let board = Board::new(rows[0].len(), rows.len());
+        Game::new(board, MineLayout::Fixed(mines))
     }
 
     /// The board as the player sees it, one string per row: `#` covered, `F` flag,
     /// `?` question mark, `.` open blank, `1`-`8` open number, `*` mine, `X` the mine
     /// that exploded, `x` a wrong flag.
     fn render(game: &Game) -> Vec<String> {
-        let (cols, rows) = game.size();
-        (0..rows)
-            .map(|y| {
-                (0..cols)
-                    .map(|x| match game.view(y * cols + x) {
-                        CellView::Hidden => '#',
-                        CellView::Flag => 'F',
-                        CellView::Question => '?',
-                        CellView::Open(0) => '.',
-                        CellView::Open(n) => char::from(b'0' + n),
-                        CellView::Mine => '*',
-                        CellView::ExplodedMine => 'X',
-                        CellView::WrongFlag => 'x',
-                    })
-                    .collect()
+        let board = game.board();
+        let symbols: Vec<char> = board
+            .cells()
+            .map(|cell| match game.view(cell) {
+                CellView::Covered => '#',
+                CellView::Flag => 'F',
+                CellView::Question => '?',
+                CellView::Open(0) => '.',
+                CellView::Open(n) => char::from(b'0' + n),
+                CellView::Mine => '*',
+                CellView::ExplodedMine => 'X',
+                CellView::WrongFlag => 'x',
             })
+            .collect();
+        symbols
+            .chunks(board.cols())
+            .map(|row| row.iter().collect())
             .collect()
     }
 
@@ -454,43 +507,58 @@ mod tests {
     }
 
     #[test]
-    fn neighbours_stay_in_bounds() {
-        let game = Game::new(4, 3, MineLayout::Fixed(Vec::new()));
-        let counts: Vec<usize> = (0..12).map(|i| game.neighbors(i).count()).collect();
-        assert_eq!(counts, [3, 5, 5, 3, 5, 8, 8, 5, 3, 5, 5, 3]);
-        assert!((0..12).flat_map(|i| game.neighbors(i)).all(|n| n < 12));
-
-        let single = Game::new(1, 1, MineLayout::Fixed(Vec::new()));
-        assert_eq!(single.neighbors(0).count(), 0);
+    fn cells_are_numbered_row_by_row() {
+        let board = Board::new(4, 3);
+        assert_eq!(board.cells(), 0..12);
+        assert_eq!(board.cell(1, 2), 9);
+        assert_eq!(board.position(9), (1, 2));
+        assert_eq!(Board::new(0, 0).cells(), 0..1);
     }
 
     #[test]
-    fn first_click_and_its_neighbours_are_always_safe() {
+    fn neighbours_stay_on_the_board() {
+        let board = Board::new(4, 3);
+        let counts: Vec<usize> = board.cells().map(|c| board.neighbours(c).count()).collect();
+        assert_eq!(counts, [3, 5, 5, 3, 5, 8, 8, 5, 3, 5, 5, 3]);
+        assert!(
+            board
+                .cells()
+                .flat_map(|c| board.neighbours(c))
+                .all(|n| n < 12)
+        );
+        assert_eq!(Board::new(1, 1).neighbours(0).count(), 0);
+    }
+
+    #[test]
+    fn first_reveal_and_its_neighbours_are_always_safe() {
         let now = Instant::now();
         for difficulty in Difficulty::ALL {
             let (cols, rows, mines) = difficulty.spec();
+            let board = Board::new(cols, rows);
             for seed in 0..200 {
-                let click = StdRng::seed_from_u64(seed).random_range(0..cols * rows);
-                let mut game = Game::new(cols, rows, MineLayout::Random { mines, seed });
-                game.reveal(click, now);
+                let first = StdRng::seed_from_u64(seed).random_range(board.cells());
+                let mut game = Game::new(board, MineLayout::Random { mines, seed });
+                game.reveal(first, now);
 
-                // No neighbouring mines, so the first click always opens an area.
-                assert_eq!(game.view(click), CellView::Open(0));
+                // No neighbouring mines, so the first reveal always spreads.
+                assert_eq!(game.view(first), CellView::Open(0));
                 assert!(
-                    game.neighbors(click)
+                    board
+                        .neighbours(first)
                         .all(|n| matches!(game.view(n), CellView::Open(_)))
                 );
 
-                // Step on every covered cell in turn until the game ends: every mine is then
+                // Reveal every covered cell in turn until the game ends: every mine is then
                 // on show, as a mine if it was lost or as a flag if it was won.
-                for i in 0..cols * rows {
-                    game.reveal(i, now);
+                for cell in board.cells() {
+                    game.reveal(cell, now);
                 }
                 assert!(game.is_over());
-                let shown = (0..cols * rows)
-                    .filter(|&i| {
+                let shown = board
+                    .cells()
+                    .filter(|&cell| {
                         matches!(
-                            game.view(i),
+                            game.view(cell),
                             CellView::Mine | CellView::ExplodedMine | CellView::Flag
                         )
                     })
@@ -501,8 +569,8 @@ mod tests {
     }
 
     #[test]
-    fn crowded_board_still_protects_the_first_click() {
-        let mut game = Game::new(3, 3, MineLayout::Random { mines: 8, seed: 7 });
+    fn crowded_board_still_protects_the_first_reveal() {
+        let mut game = Game::new(Board::new(3, 3), MineLayout::Random { mines: 8, seed: 7 });
         game.reveal(4, Instant::now());
         assert!(matches!(game.status(), GameStatus::Won { .. }));
         assert_eq!(render(&game), ["FFF", "F8F", "FFF"]);
@@ -510,17 +578,18 @@ mod tests {
 
     #[test]
     fn mine_count_is_capped_to_leave_a_safe_cell() {
-        assert_eq!(Game::new(2, 2, MineLayout::random(50)).mines_left(), 3);
+        let game = Game::new(Board::new(2, 2), MineLayout::random(50));
+        assert_eq!(game.mines_left(), 3);
     }
 
     #[test]
     fn fixed_layout_ignores_cells_off_the_board_and_repeats() {
-        let game = Game::new(2, 2, MineLayout::Fixed(vec![3, 3, 9]));
+        let game = Game::new(Board::new(2, 2), MineLayout::Fixed(vec![3, 3, 9]));
         assert_eq!(game.mines_left(), 1);
     }
 
     #[test]
-    fn flood_fill_opens_the_blank_region_and_its_numbered_border() {
+    fn flood_fill_reveals_the_blank_region_and_its_numbered_border() {
         let mut game = game_from(&[
             "....", //
             "....", //
@@ -541,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn flood_fill_skips_flags_but_opens_question_marks() {
+    fn flood_fill_skips_flags_but_reveals_question_marks() {
         let mut game = game_from(&[
             "....", //
             "....", //
@@ -564,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn right_click_cycles_marks_and_updates_the_counter() {
+    fn marking_cycles_and_updates_the_counter() {
         let mut game = game_from(&["*..", "...", "..."]);
         assert_eq!(game.mines_left(), 1);
         game.cycle_mark(4);
@@ -574,7 +643,7 @@ mod tests {
         game.cycle_mark(4);
         assert_eq!((game.view(4), game.mines_left()), (CellView::Question, 0));
         game.cycle_mark(4);
-        assert_eq!((game.view(4), game.mines_left()), (CellView::Hidden, 0));
+        assert_eq!((game.view(4), game.mines_left()), (CellView::Covered, 0));
     }
 
     #[test]
@@ -586,12 +655,12 @@ mod tests {
         assert_eq!(game.status(), GameStatus::Ready);
 
         game.reveal(2, now);
-        game.cycle_mark(1); // already open
+        game.cycle_mark(1); // already revealed
         assert_eq!(render(&game), ["F1.", "#21", "###"]);
     }
 
     #[test]
-    fn chord_opens_neighbours_when_flags_match() {
+    fn chord_reveals_neighbours_when_flags_match() {
         let now = Instant::now();
         let mut game = game_from(&["*..", "...", "..*"]);
         game.reveal(4, now);
@@ -623,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn losing_reveals_mines_and_wrong_flags() {
+    fn losing_shows_mines_and_wrong_flags() {
         let now = Instant::now();
         let mut game = game_from(&["*.*", "...", "*.."]);
         game.cycle_mark(0); // correct flag
@@ -658,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_indices_are_ignored() {
+    fn out_of_range_cells_are_ignored() {
         let now = Instant::now();
         let mut game = Game::with_difficulty(Difficulty::Beginner);
         game.reveal(usize::MAX, now);

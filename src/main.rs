@@ -2,9 +2,9 @@
 //! A clone of classic Windows Minesweeper built with `eframe`/`egui`.
 //!
 //! Controls:
-//! * Left click: reveal a cell. The first click is always safe.
-//! * Right click: cycle a covered cell through flag, question mark and unmarked.
-//! * Middle click, or left+right together, on a number: "chord", which reveals
+//! * Left button: reveal a cell. The first reveal is always safe.
+//! * Right button: cycle a covered cell through flag, question mark and unmarked.
+//! * Middle button, or left+right together, on a number: "chord", which reveals
 //!   every unflagged neighbour once the matching number of flags is placed.
 //! * F2 or the face: start a new game.
 //!
@@ -22,7 +22,7 @@ use eframe::egui::{
 };
 
 use board_input::{BoardInput, Buttons, PointerFrame};
-use game::{CellView, Difficulty, Game, GameStatus};
+use game::{Board, CellView, Difficulty, Game, GameStatus};
 
 fn main() -> eframe::Result {
     let difficulty = Difficulty::Beginner;
@@ -105,16 +105,17 @@ fn lcd_size() -> Vec2 {
 }
 
 /// Size of everything below the menu bar: header, board and the frame around them.
-fn game_area_size(cols: usize, rows: usize) -> Vec2 {
+fn game_area_size(board: Board) -> Vec2 {
     let inset = 2.0 * (FRAME_BEVEL + MARGIN);
-    let board = vec2(cols as f32, rows as f32) * CELL + Vec2::splat(2.0 * FRAME_BEVEL);
+    let cells = vec2(board.cols() as f32, board.rows() as f32) * CELL;
+    let board_frame = cells + Vec2::splat(2.0 * FRAME_BEVEL);
     let header = HEADER_HEIGHT + 2.0 * HEADER_BEVEL + MARGIN;
-    vec2(inset + board.x, inset + header + board.y)
+    vec2(inset + board_frame.x, inset + header + board_frame.y)
 }
 
 fn window_size(difficulty: Difficulty, menu_height: f32) -> Vec2 {
     let (cols, rows, _) = difficulty.spec();
-    game_area_size(cols, rows) + vec2(0.0, menu_height)
+    game_area_size(Board::new(cols, rows)) + vec2(0.0, menu_height)
 }
 
 /// Screen rectangles of every part of the game area for one frame.
@@ -126,13 +127,13 @@ struct Layout {
     timer_lcd: Rect,
     board_frame: Rect,
     board: Rect,
-    cols: usize,
-    rows: usize,
+    /// The board being laid out: its size, and how its cells are numbered.
+    shape: Board,
 }
 
 impl Layout {
-    fn new(min: Pos2, cols: usize, rows: usize) -> Self {
-        let area = Rect::from_min_size(min, game_area_size(cols, rows));
+    fn new(min: Pos2, shape: Board) -> Self {
+        let area = Rect::from_min_size(min, game_area_size(shape));
         let inner = area.shrink(FRAME_BEVEL + MARGIN);
         let header = Rect::from_min_size(
             inner.min,
@@ -151,13 +152,12 @@ impl Layout {
             timer_lcd: Rect::from_min_size(pos2(header.max.x - side - lcd.x, lcd_top), lcd),
             board_frame,
             board: board_frame.shrink(FRAME_BEVEL),
-            cols,
-            rows,
+            shape,
         }
     }
 
     fn cell_rect(&self, idx: usize) -> Rect {
-        let (x, y) = (idx % self.cols, idx / self.cols);
+        let (x, y) = self.shape.position(idx);
         Rect::from_min_size(
             self.board.min + vec2(x as f32, y as f32) * CELL,
             Vec2::splat(CELL),
@@ -169,32 +169,35 @@ impl Layout {
             return None;
         }
         let rel = (pos - self.board.min) / CELL;
-        let x = (rel.x as usize).min(self.cols - 1);
-        let y = (rel.y as usize).min(self.rows - 1);
-        Some(y * self.cols + x)
+        let x = (rel.x as usize).min(self.shape.cols() - 1);
+        let y = (rel.y as usize).min(self.shape.rows() - 1);
+        Some(self.shape.cell(x, y))
     }
 }
 
 /// Reads this frame's pointer in board terms. `on_board` is egui's answer to whether the
-/// board itself is under the pointer, which is false where an open menu covers it.
+/// board itself is under the pointer, which is false where an open menu lies over it.
 fn read_pointer(ctx: &egui::Context, layout: &Layout, on_board: bool) -> PointerFrame {
     ctx.input(|i| {
         let p = &i.pointer;
         PointerFrame {
             cell: p.hover_pos().and_then(|pos| layout.cell_at(pos)),
             on_board,
-            down: buttons(|b| p.button_down(b)),
-            pressed: buttons(|b| p.button_pressed(b)),
-            released: buttons(|b| p.button_released(b)),
+            down: Buttons::from_egui(|b| p.button_down(b)),
+            pressed: Buttons::from_egui(|b| p.button_pressed(b)),
+            released: Buttons::from_egui(|b| p.button_released(b)),
         }
     })
 }
 
-fn buttons(f: impl Fn(PointerButton) -> bool) -> Buttons {
-    Buttons {
-        left: f(PointerButton::Primary),
-        right: f(PointerButton::Secondary),
-        middle: f(PointerButton::Middle),
+impl Buttons {
+    /// Which of egui's pointer buttons satisfy `test`.
+    fn from_egui(test: impl Fn(PointerButton) -> bool) -> Self {
+        Self {
+            left: test(PointerButton::Primary),
+            right: test(PointerButton::Secondary),
+            middle: test(PointerButton::Middle),
+        }
     }
 }
 
@@ -204,7 +207,7 @@ fn face_glyph(status: GameStatus, holding: bool) -> &'static str {
         GameStatus::Won { .. } => "😎",
         GameStatus::Lost { .. } => "😵",
         GameStatus::Ready | GameStatus::Playing { .. } if holding => "😮",
-        // egui's bundled emoji font has no U+1F642 🙂, so use the classic U+263A smiley.
+        // egui's bundled emoji font has no U+1F642 🙂, so use the classic U+263A ☺ instead.
         GameStatus::Ready | GameStatus::Playing { .. } => "☺",
     }
 }
@@ -269,20 +272,20 @@ impl MinesweeperApp {
     }
 
     fn game_area(&mut self, ui: &mut egui::Ui, now: Instant) {
-        let (cols, rows) = self.game.size();
+        let board = self.game.board();
         let full = ui.max_rect();
-        let width = game_area_size(cols, rows).x;
+        let width = game_area_size(board).x;
         let min = pos2((full.center().x - width / 2.0).max(full.min.x), full.min.y).round();
-        let layout = Layout::new(min, cols, rows);
+        let layout = Layout::new(min, board);
 
         ui.allocate_rect(layout.area, Sense::hover());
         let face = ui.interact(layout.face, ui.scope_id().with("face"), Sense::click());
-        let board = ui.interact(layout.board, ui.scope_id().with("board"), Sense::click());
+        let board_area = ui.interact(layout.board, ui.scope_id().with("board"), Sense::click());
         if face.clicked() {
             self.new_game();
         }
 
-        let pointer = read_pointer(ui.ctx(), &layout, board.hovered());
+        let pointer = read_pointer(ui.ctx(), &layout, board_area.hovered());
         let feedback = self.input.frame(&mut self.game, pointer, now);
 
         let painter = ui.painter_at(layout.area);
@@ -299,7 +302,7 @@ impl MinesweeperApp {
             face_glyph(self.game.status(), feedback.holding),
             face.is_pointer_button_down_on(),
         );
-        for idx in 0..cols * rows {
+        for idx in board.cells() {
             paint_cell(
                 &painter,
                 layout.cell_rect(idx),
@@ -464,7 +467,7 @@ fn paint_face(painter: &Painter, rect: Rect, face: &str, held: bool) {
 fn paint_cell(painter: &Painter, rect: Rect, view: CellView, pressed: bool) {
     let raised = match view {
         CellView::Flag => true,
-        CellView::Hidden | CellView::Question => !pressed,
+        CellView::Covered | CellView::Question => !pressed,
         _ => false,
     };
     if raised {
@@ -506,7 +509,7 @@ fn paint_cell(painter: &Painter, rect: Rect, view: CellView, pressed: bool) {
             paint_symbol(painter, center, "💣", Color32::BLACK)
         }
         CellView::WrongFlag => paint_symbol(painter, center, "❌", FLAG_RED),
-        CellView::Hidden | CellView::Open(_) => {}
+        CellView::Covered | CellView::Open(_) => {}
     }
 }
 
@@ -571,7 +574,7 @@ mod tests {
 
     #[test]
     fn layout_maps_points_to_cells_inside_the_board_only() {
-        let layout = Layout::new(Pos2::ZERO, 9, 9);
+        let layout = Layout::new(Pos2::ZERO, Board::new(9, 9));
         let first = layout.cell_rect(0);
         let last = layout.cell_rect(80);
         assert_eq!(layout.cell_at(first.center()), Some(0));
