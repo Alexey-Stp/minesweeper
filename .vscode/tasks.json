@@ -1,0 +1,52 @@
+{
+  // Run with Terminal > Run Task... (or Ctrl+Shift+B for the default "Run" task).
+  "version": "2.0.0",
+  // rustup installs cargo to ~/.cargo/bin; make sure it is found even if it is not on PATH.
+  "windows": {
+    "options": { "env": { "PATH": "${userHome}\\.cargo\\bin;${env:PATH}" } }
+  },
+  "linux": {
+    "options": { "env": { "PATH": "${userHome}/.cargo/bin:${env:PATH}" } }
+  },
+  "osx": {
+    "options": { "env": { "PATH": "${userHome}/.cargo/bin:${env:PATH}" } }
+  },
+  "tasks": [
+    {
+      "label": "Run",
+      "detail": "cargo run (debug build)",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["run"],
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Run (release)",
+      "detail": "cargo run --release",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["run", "--release"],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Build",
+      "detail": "cargo build",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["build"],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Test",
+      "detail": "cargo test",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["test"],
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": []
+    }
+  ]
+}
